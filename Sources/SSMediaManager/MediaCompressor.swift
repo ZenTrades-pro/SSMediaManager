@@ -36,8 +36,10 @@ class MediaCompressor {
                 completion(nil, exportSession.error)
             case .cancelled:
                 completion(nil, NSError(domain: "VideoCompressor", code: 0, userInfo: [NSLocalizedDescriptionKey: "Video compression was cancelled"]))
-            default:
-                break
+            @unknown default:
+                // Guard against future AVAssetExportSession status values — always deliver
+                // a completion so the upload chain is never permanently stalled.
+                completion(nil, NSError(domain: "VideoCompressor", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video compression ended with an unexpected status: \(exportSession.status.rawValue)"]))
             }
         }
     }
@@ -50,6 +52,8 @@ class MediaCompressor {
 
                 guard compressionMode != .noCompression,
                       let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                    // `return` only exits this autoreleasepool closure, not the outer async block.
+                    // completion() must be called here; there must be NO call after the pool closes.
                     DispatchQueue.main.async { completion() }
                     return
                 }
@@ -59,11 +63,13 @@ class MediaCompressor {
                 let shouldCompress = isToCompressFile(fromPath: fileUrl.path, compressionMode: compressionMode)
 
                 // Inner pool scopes the original full-res UIImage (~47 MB).
-                // When compression occurs, the resized copy is assigned to imageToSave
-                // and the original is freed when this inner pool drains — before saveImageWithEXIF runs.
+                // When shouldCompress is true, imageToSave is a new smaller UIImage and the
+                // original is eligible for release when this pool drains — before saveImageWithEXIF.
+                // When shouldCompress is false, imageToSave == original (same reference), so the
+                // pool provides no early-release benefit, but autoreleased objects are still bounded.
                 var imageToSave: UIImage?
                 autoreleasepool {
-                    guard let original = load(fileName: fileName) else { return }
+                    guard let original = load(fileURL: fileUrl) else { return }
                     imageToSave = (shouldCompress ? original.resizedForCompression(to: compressionMode) : nil) ?? original
                 }
 
@@ -77,8 +83,14 @@ class MediaCompressor {
                 } catch {
                     imageToSave.jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
                 }
+
+                // Single terminal completion call — only reached via the happy path.
+                // All early-return paths above call completion() before their own `return`.
+                DispatchQueue.main.async { completion() }
             }
-            DispatchQueue.main.async { completion() }
+            // Intentionally no completion() call here — `return` inside autoreleasepool only
+            // exits that closure, so any call placed here would fire on every early-return path
+            // causing a double invocation.
         }
     }
     
@@ -103,8 +115,7 @@ class MediaCompressor {
         }
     }
     
-    class func load(fileName: String) -> UIImage? {
-        guard let fileURL = documentsUrl?.appendingPathComponent(fileName) else { return nil }
+    class func load(fileURL: URL) -> UIImage? {
         // CGImageSource avoids allocating a Data buffer for the raw JPEG bytes before decoding
         let options = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, options),
