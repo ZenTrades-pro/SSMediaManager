@@ -79,6 +79,57 @@ public class SSMediaManager{
         }
     }
     
+    // Compresses a media file in-place and returns an updated SSMedia with EXIF metadata populated.
+    // For images/videos the file on disk is overwritten with the compressed version.
+    // EXIF extraction and compression both run on a background queue to avoid blocking the main thread.
+    // Completion is always called on the main queue.
+    public func compressMediaFile(media: SSMedia, completion: @escaping (SSMedia) -> Void) {
+        if (media.mimeType ?? "").contains("video") {
+            DispatchQueue.global(qos: .userInitiated).async {
+                var mediaWithMetadata = media
+                if let filePath = media.filePath {
+                    mediaWithMetadata.exifMetadata = EXIFMetadataHelper.extractVideoMetadata(from: URL(fileURLWithPath: filePath))
+                }
+                let inputUrl = URL(fileURLWithPath: media.filePath ?? "")
+                let documentsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                let outputUrl = documentsUrl.appendingPathComponent("compressed_\(self.removeExtension(fileName: media.name)).mp4")
+                MediaCompressor.compressVideo(inputURL: inputUrl, outputURL: outputUrl) { url, error in
+                    DispatchQueue.main.async {
+                        if error == nil, url != nil {
+                            try? FileManager.default.removeItem(at: inputUrl)
+                            try? FileManager.default.moveItem(at: outputUrl, to: inputUrl)
+                            var tempMedia = mediaWithMetadata
+                            tempMedia.filePath = inputUrl.path
+                            tempMedia.mimeType = "video/mp4"
+                            completion(tempMedia)
+                        } else {
+                            completion(mediaWithMetadata)
+                        }
+                    }
+                }
+            }
+        } else if (media.mimeType ?? "").hasPrefix("image") {
+            DispatchQueue.global(qos: .userInitiated).async {
+                var mediaWithEXIF = media
+                if let filePath = media.filePath {
+                    mediaWithEXIF.exifMetadata = EXIFMetadataHelper.extractEXIF(from: URL(fileURLWithPath: filePath))
+                }
+                // compressImage dispatches to its own background queue; completion fires on main.
+                MediaCompressor.compressImage(fileName: media.name, existingMetadata: mediaWithEXIF.exifMetadata) {
+                    completion(mediaWithEXIF)
+                }
+            }
+        } else {
+            DispatchQueue.main.async { completion(media) }
+        }
+    }
+
+    // Uploads a media file that has already been compressed. Skips the compression step.
+    // Use in tandem with compressMediaFile to pipeline compress-then-upload-concurrently.
+    public func uploadCompressedFile(media: SSMedia, baseS3URL: String, indexPath: IndexPath, index: Int, completion: @escaping UploadCompletion) {
+        uploadFile(media, baseS3URL, indexPath, index, completion)
+    }
+
     func removeExtension(fileName:String) -> String {
         var components = fileName.components(separatedBy: ".")
         if components.count > 1 { // If there is a file extension
