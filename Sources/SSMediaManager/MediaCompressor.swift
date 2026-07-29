@@ -7,6 +7,7 @@
 
 import Foundation
 import AVFoundation
+import ImageIO
 import UIKit
 
 var documentsUrl: URL? {
@@ -41,28 +42,42 @@ class MediaCompressor {
         }
     }
     
-    class func compressImage(fileName: String, completion: @escaping () -> Void) {
+    class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping () -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let modeValue = UserDefaults.standard.value(forKey: "CompressionModeFloat") as? CGFloat ?? 0.5
-            let compressionMode = CompressionMode(rawValue: modeValue) ?? .medium
+            autoreleasepool {
+                let modeValue = UserDefaults.standard.value(forKey: "CompressionModeFloat") as? CGFloat ?? 0.5
+                let compressionMode = CompressionMode(rawValue: modeValue) ?? .medium
 
-            guard compressionMode != .noCompression,
-                  let image = load(fileName: fileName),
-                  let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
-                DispatchQueue.main.async { completion() }
-                return
+                guard compressionMode != .noCompression,
+                      let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+
+                // Use caller-supplied EXIF if available to avoid a redundant file open
+                let originalMetadata = existingMetadata ?? EXIFMetadataHelper.extractEXIF(from: fileUrl)
+                let shouldCompress = isToCompressFile(fromPath: fileUrl.path, compressionMode: compressionMode)
+
+                // Inner pool scopes the original full-res UIImage (~47 MB).
+                // When compression occurs, the resized copy is assigned to imageToSave
+                // and the original is freed when this inner pool drains — before saveImageWithEXIF runs.
+                var imageToSave: UIImage?
+                autoreleasepool {
+                    guard let original = load(fileName: fileName) else { return }
+                    imageToSave = (shouldCompress ? original.resizedForCompression(to: compressionMode) : nil) ?? original
+                }
+
+                guard let imageToSave else {
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+
+                do {
+                    try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
+                } catch {
+                    imageToSave.jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
+                }
             }
-
-            let originalMetadata = EXIFMetadataHelper.extractEXIF(from: fileUrl)
-            let shouldCompress = isToCompressFile(fromPath: fileUrl.path, compressionMode: compressionMode)
-            let imageToSave: UIImage = (shouldCompress ? image.resizedForCompression(to: compressionMode) : nil) ?? image
-
-            do {
-                try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
-            } catch {
-                image.jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
-            }
-
             DispatchQueue.main.async { completion() }
         }
     }
@@ -90,12 +105,11 @@ class MediaCompressor {
     
     class func load(fileName: String) -> UIImage? {
         guard let fileURL = documentsUrl?.appendingPathComponent(fileName) else { return nil }
-        do {
-            let imageData = try Data(contentsOf: fileURL)
-            return UIImage(data: imageData)
-        } catch {
-            return nil
-        }
+        // CGImageSource avoids allocating a Data buffer for the raw JPEG bytes before decoding
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, options),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+        return UIImage(cgImage: cgImage)
     }
 }
 
@@ -147,7 +161,7 @@ extension UIImage {
         
         while let data = imageData, Double(data.count) / (1024 * 1024) > targetSizeInMB, quality > decrement {
             quality -= decrement
-            imageData = resizedImage.jpeg(compressionMode)
+            imageData = resizedImage.jpegData(compressionQuality: quality)
         }
         return imageData
     }
@@ -160,14 +174,7 @@ extension UIImage {
 
 extension Data {
     func getSizeInMB() -> Double {
-        let bcf = ByteCountFormatter()
-        bcf.allowedUnits = [.useMB]
-        bcf.countStyle = .file
-        let string = bcf.string(fromByteCount: Int64(self.count)).replacingOccurrences(of: ",", with: ".")
-        if let double = Double(string.replacingOccurrences(of: " MB", with: "")) {
-            return double
-        }
-        return 0.0
+        return Double(count) / (1024.0 * 1024.0)
     }
 }
 

@@ -47,7 +47,10 @@ extension TimeZone {
 }
 // MARK: - EXIF Metadata Utilities
 public class EXIFMetadataHelper {
-    
+
+    // Shared CIContext — creating one per saveImageWithEXIF call allocates Metal/GPU resources each time
+    private static let sharedCIContext = CIContext(options: [.useSoftwareRenderer: false])
+
     /// Sanitize string values for S3 metadata headers (US-ASCII only, no control characters)
     private static func sanitizeHeaderValue(_ value: String) -> String? {
         // Remove non-ASCII characters and control characters
@@ -289,8 +292,7 @@ public class EXIFMetadataHelper {
         let uprightImage = image.fixedOrientation()
 
         guard let cgImage = uprightImage.cgImage ?? uprightImage.ciImage.flatMap({ ciImage in
-            let context = CIContext()
-            return context.createCGImage(ciImage, from: ciImage.extent)
+            sharedCIContext.createCGImage(ciImage, from: ciImage.extent)
         }) else {
             throw NSError(domain: "EXIFMetadataHelper", code: 3, userInfo: [NSLocalizedDescriptionKey: "Failed to get CGImage from UIImage"])
         }

@@ -65,7 +65,8 @@ public class SSMediaManager{
                 mediaWithEXIF.exifMetadata = EXIFMetadataHelper.extractEXIF(from: fileUrl)
             }
             
-            MediaCompressor.compressImage(fileName: media.name) {
+            // Pass extracted EXIF so compressImage skips a redundant file open
+            MediaCompressor.compressImage(fileName: media.name, existingMetadata: mediaWithEXIF.exifMetadata) {
                 self.uploadFile(mediaWithEXIF, baseS3URL, indexPath, index, completion)
             }
             
