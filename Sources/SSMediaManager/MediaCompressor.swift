@@ -81,7 +81,8 @@ class MediaCompressor {
                 do {
                     try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
                 } catch {
-                    imageToSave.jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
+                    // fixedOrientation() bakes the rotation into pixels before jpegData(), which strips EXIF metadata.
+                    imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
                 }
 
                 // Single terminal completion call — only reached via the happy path.
@@ -120,7 +121,17 @@ class MediaCompressor {
         let options = [kCGImageSourceShouldCache: false] as CFDictionary
         guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, options),
               let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
-        return UIImage(cgImage: cgImage)
+
+        // Preserve EXIF orientation so fixedOrientation() inside saveImageWithEXIF can normalize it.
+        // UIImage(cgImage:) always defaults to .up, losing the rotation metadata.
+        var uiOrientation = UIImage.Orientation.up
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+           let raw = props[kCGImagePropertyOrientation as String] as? UInt32,
+           let cgOrientation = CGImagePropertyOrientation(rawValue: raw) {
+            uiOrientation = UIImage.Orientation(cgOrientation)
+        }
+
+        return UIImage(cgImage: cgImage, scale: 1.0, orientation: uiOrientation)
     }
 }
 

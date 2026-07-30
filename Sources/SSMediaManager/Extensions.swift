@@ -325,29 +325,36 @@ public class EXIFMetadataHelper {
     }
 }
 
-extension UIImage {
-    /// Returns an image with orientation fixed to .up by redrawing it.
-    func fixedOrientation() -> UIImage {
-//        guard imageOrientation != .up else { return self }
-        
-        let needsSwap: Bool
-        switch imageOrientation {
-        case .left, .leftMirrored, .right, .rightMirrored:
-            needsSwap = true
-        default:
-            needsSwap = false
+extension UIImage.Orientation {
+    // UIKit uses the same left/right naming as CGImagePropertyOrientation.
+    // UIImage(contentsOfFile:) on an EXIF-6 (CG .right) portrait JPEG sets imageOrientation = .right.
+    init(_ cg: CGImagePropertyOrientation) {
+        switch cg {
+        case .up:            self = .up
+        case .upMirrored:    self = .upMirrored
+        case .down:          self = .down
+        case .downMirrored:  self = .downMirrored
+        case .left:          self = .left
+        case .leftMirrored:  self = .leftMirrored
+        case .right:         self = .right
+        case .rightMirrored: self = .rightMirrored
         }
-        
-        let canvasSize = needsSwap
-        ? CGSize(width: size.height, height: size.width)
-        : size
-        
+    }
+}
+
+extension UIImage {
+    /// Returns a new image with orientation baked into the pixel buffer (.up) by redrawing it.
+    /// UIImage.size already reports display dimensions, so we use it directly as the canvas.
+    /// UIKit's draw(in:) applies the orientation transform, producing correctly-oriented pixels.
+    func fixedOrientation() -> UIImage {
+        guard imageOrientation != .up else { return self }
+
         let format = UIGraphicsImageRendererFormat()
         format.scale = scale
         format.opaque = false
-        
-        return UIGraphicsImageRenderer(size: canvasSize, format: format)
-            .image { _ in self.draw(in: CGRect(origin: .zero, size: canvasSize)) }
+
+        return UIGraphicsImageRenderer(size: size, format: format)
+            .image { _ in self.draw(in: CGRect(origin: .zero, size: size)) }
     }
 }
 
