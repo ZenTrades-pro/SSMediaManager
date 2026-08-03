@@ -7,6 +7,7 @@
 
 import Foundation
 import AVFoundation
+import ImageIO
 import UIKit
 
 var documentsUrl: URL? {
@@ -35,35 +36,62 @@ class MediaCompressor {
                 completion(nil, exportSession.error)
             case .cancelled:
                 completion(nil, NSError(domain: "VideoCompressor", code: 0, userInfo: [NSLocalizedDescriptionKey: "Video compression was cancelled"]))
-            default:
-                break
+            @unknown default:
+                // Guard against future AVAssetExportSession status values — always deliver
+                // a completion so the upload chain is never permanently stalled.
+                completion(nil, NSError(domain: "VideoCompressor", code: -1, userInfo: [NSLocalizedDescriptionKey: "Video compression ended with an unexpected status: \(exportSession.status.rawValue)"]))
             }
         }
     }
     
-    class func compressImage(fileName: String, completion: @escaping () -> Void) {
+    class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping () -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
-            let modeValue = UserDefaults.standard.value(forKey: "CompressionModeFloat") as? CGFloat ?? 0.5
-            let compressionMode = CompressionMode(rawValue: modeValue) ?? .medium
+            autoreleasepool {
+                let modeValue = UserDefaults.standard.value(forKey: "CompressionModeFloat") as? CGFloat ?? 0.5
+                let compressionMode = CompressionMode(rawValue: modeValue) ?? .medium
 
-            guard compressionMode != .noCompression,
-                  let image = load(fileName: fileName),
-                  let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                guard compressionMode != .noCompression,
+                      let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                    // `return` only exits this autoreleasepool closure, not the outer async block.
+                    // completion() must be called here; there must be NO call after the pool closes.
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+
+                // Use caller-supplied EXIF if available to avoid a redundant file open
+                let originalMetadata = existingMetadata ?? EXIFMetadataHelper.extractEXIF(from: fileUrl)
+                let shouldCompress = isToCompressFile(fromPath: fileUrl.path, compressionMode: compressionMode)
+
+                // Inner pool scopes the original full-res UIImage (~47 MB).
+                // When shouldCompress is true, imageToSave is a new smaller UIImage and the
+                // original is eligible for release when this pool drains — before saveImageWithEXIF.
+                // When shouldCompress is false, imageToSave == original (same reference), so the
+                // pool provides no early-release benefit, but autoreleased objects are still bounded.
+                var imageToSave: UIImage?
+                autoreleasepool {
+                    guard let original = load(fileURL: fileUrl) else { return }
+                    imageToSave = (shouldCompress ? original.resizedForCompression(to: compressionMode) : nil) ?? original
+                }
+
+                guard let imageToSave else {
+                    DispatchQueue.main.async { completion() }
+                    return
+                }
+
+                do {
+                    try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
+                } catch {
+                    // fixedOrientation() bakes the rotation into pixels before jpegData(), which strips EXIF metadata.
+                    imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
+                }
+
+                // Single terminal completion call — only reached via the happy path.
+                // All early-return paths above call completion() before their own `return`.
                 DispatchQueue.main.async { completion() }
-                return
             }
-
-            let originalMetadata = EXIFMetadataHelper.extractEXIF(from: fileUrl)
-            let shouldCompress = isToCompressFile(fromPath: fileUrl.path, compressionMode: compressionMode)
-            let imageToSave: UIImage = (shouldCompress ? image.resizedForCompression(to: compressionMode) : nil) ?? image
-
-            do {
-                try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
-            } catch {
-                image.jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
-            }
-
-            DispatchQueue.main.async { completion() }
+            // Intentionally no completion() call here — `return` inside autoreleasepool only
+            // exits that closure, so any call placed here would fire on every early-return path
+            // causing a double invocation.
         }
     }
     
@@ -88,14 +116,22 @@ class MediaCompressor {
         }
     }
     
-    class func load(fileName: String) -> UIImage? {
-        guard let fileURL = documentsUrl?.appendingPathComponent(fileName) else { return nil }
-        do {
-            let imageData = try Data(contentsOf: fileURL)
-            return UIImage(data: imageData)
-        } catch {
-            return nil
+    class func load(fileURL: URL) -> UIImage? {
+        // CGImageSource avoids allocating a Data buffer for the raw JPEG bytes before decoding
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let source = CGImageSourceCreateWithURL(fileURL as CFURL, options),
+              let cgImage = CGImageSourceCreateImageAtIndex(source, 0, nil) else { return nil }
+
+        // Preserve EXIF orientation so fixedOrientation() inside saveImageWithEXIF can normalize it.
+        // UIImage(cgImage:) always defaults to .up, losing the rotation metadata.
+        var uiOrientation = UIImage.Orientation.up
+        if let props = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [String: Any],
+           let raw = props[kCGImagePropertyOrientation as String] as? UInt32,
+           let cgOrientation = CGImagePropertyOrientation(rawValue: raw) {
+            uiOrientation = UIImage.Orientation(cgOrientation)
         }
+
+        return UIImage(cgImage: cgImage, scale: 1.0, orientation: uiOrientation)
     }
 }
 
@@ -147,7 +183,7 @@ extension UIImage {
         
         while let data = imageData, Double(data.count) / (1024 * 1024) > targetSizeInMB, quality > decrement {
             quality -= decrement
-            imageData = resizedImage.jpeg(compressionMode)
+            imageData = resizedImage.jpegData(compressionQuality: quality)
         }
         return imageData
     }
@@ -160,14 +196,7 @@ extension UIImage {
 
 extension Data {
     func getSizeInMB() -> Double {
-        let bcf = ByteCountFormatter()
-        bcf.allowedUnits = [.useMB]
-        bcf.countStyle = .file
-        let string = bcf.string(fromByteCount: Int64(self.count)).replacingOccurrences(of: ",", with: ".")
-        if let double = Double(string.replacingOccurrences(of: " MB", with: "")) {
-            return double
-        }
-        return 0.0
+        return Double(count) / (1024.0 * 1024.0)
     }
 }
 
