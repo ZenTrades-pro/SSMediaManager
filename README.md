@@ -2,7 +2,7 @@
 
 ## Installation
 
-ZTMediaManager is available through Swift Package Manager. To install
+SSMediaManager is available through Swift Package Manager. To install
 it, simply add the following dependencies:
 
 ```
