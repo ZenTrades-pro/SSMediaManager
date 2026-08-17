@@ -4,21 +4,81 @@ import SwiftUI
 
 public typealias UploadCompletion = (_ json: [String: Any]?, _ data: Data?, _ response: URLResponse?, _ error: Error?, _ indexPath: IndexPath?, _ index: Int?) -> Void
 
-struct APIManager{
+public enum MediaType {
+    case image
+    case pdf
+    case video
+}
+
+public class APIManager{
     
-    var session:Session
+    private var imageSession: Session
+    private var videoSession: Session
+    
     public static var shared = APIManager()
+    private let reachability = NetworkReachabilityManager()
     
     private init(){
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 300
-        configuration.timeoutIntervalForResource = 300
-        configuration.waitsForConnectivity = true
         let rootQueue = DispatchQueue(label: "io.smartserv.session.rootQueue")
         let requestQueue = DispatchQueue(label: "io.smartserv.session.requestQueue")
         let serializationQueue = DispatchQueue(label: "io.smartserv.session.serializationQueue",attributes:.concurrent)
+        let interceptor = RequestInterceptor()
         
-        session = Session(configuration: configuration, rootQueue:rootQueue,requestQueue:requestQueue,serializationQueue:serializationQueue,interceptor: RequestInterceptor())
+        // Base configuration
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 45
+        configuration.waitsForConnectivity = true
+        
+        // Image & PDF Session (90s timeout)
+        let imageConfig = configuration.copy() as! URLSessionConfiguration
+        imageConfig.timeoutIntervalForResource = 90
+        imageSession = Session(configuration: imageConfig, rootQueue: rootQueue, requestQueue: requestQueue, serializationQueue: serializationQueue, interceptor: interceptor)
+        
+        // Video Session (240s timeout)
+        let videoConfig = configuration.copy() as! URLSessionConfiguration
+        videoConfig.timeoutIntervalForResource = 240
+        videoSession = Session(configuration: videoConfig, rootQueue: rootQueue, requestQueue: requestQueue, serializationQueue: serializationQueue, interceptor: interceptor)
+        
+        startMonitoring()
+    }
+
+    private func startMonitoring() {
+        reachability?.startListening { status in
+            let isConnected = status == .reachable(.ethernetOrWiFi) || status == .reachable(.cellular)
+            SSMediaManager.shared.networkStatusChanged(isConnected: isConnected)
+            
+            if !isConnected {
+                debugPrint("Network connection lost")
+            } else {
+                debugPrint("Network connection restored")
+            }
+        }
+    }
+
+    private func getSession(for media: SSMedia) -> Session {
+        let type = getMediaType(for: media)
+        switch type {
+        case .video:
+            return videoSession
+        default:
+            return imageSession
+        }
+    }
+
+    private func getMediaType(for media: SSMedia) -> MediaType {
+        let mime = (media.mimeType ?? "").lowercased()
+        if mime.contains("video") {
+            return .video
+        } else if mime.contains("pdf") {
+            return .pdf
+        } else {
+            return .image
+        }
+    }
+    
+    func cancelAllRequests() {
+        imageSession.cancelAllRequests()
+        videoSession.cancelAllRequests()
     }
 
     func getUploadUrl(media:SSMedia, baseS3URL: String,indexPath: IndexPath?, index: Int?, completion:@escaping UploadCompletion){
@@ -45,11 +105,12 @@ struct APIManager{
             }
         }
         
+        let session = getSession(for: media)
         let request = session.request(baseS3URL,parameters:params)
         debugPrint(request.convertible.urlRequest?.cURL())
         
-        request.responseData { responseData in
-            processAPIResponse(responseData: responseData,indexPath: indexPath, index: index, completion: completion)
+        request.responseData { [weak self] responseData in
+            self?.processAPIResponse(responseData: responseData,indexPath: indexPath, index: index, completion: completion)
         }
     }
     
@@ -86,6 +147,7 @@ struct APIManager{
             }
         }
 
+        let session = getSession(for: media)
         session.upload(url, to: uploadUrl, method: .put, headers: headers).responseData { data in
             if data.response?.statusCode == 200 {
                 completion(json, nil, data.response, nil, indexPath, index)
@@ -128,7 +190,7 @@ struct APIManager{
 final class RequestInterceptor: Alamofire.RequestInterceptor{
       var retryLimit = 2
      var isRetrying = false
-      let retryErrors = [NSURLErrorTimedOut,NSURLErrorCannotFindHost,NSURLErrorCannotParseResponse,NSURLErrorCannotConnectToHost,NSURLErrorCancelled]
+      let retryErrors = [NSURLErrorTimedOut,NSURLErrorCannotFindHost,NSURLErrorCannotParseResponse,NSURLErrorCannotConnectToHost,NSURLErrorCancelled, NSURLErrorNetworkConnectionLost, NSURLErrorNotConnectedToInternet]
     func adapt(_ urlRequest: URLRequest, for session: Session, completion: @escaping (Result<URLRequest, Error>) -> Void) {
         var urlRequest = urlRequest
 //        urlRequest.setValue(TimeZone.current.identifier, forHTTPHeaderField: "timezonename")
@@ -194,5 +256,3 @@ extension DataRequest {
         return "curl command unavailable (request not yet created)"
     }
 }
-
-

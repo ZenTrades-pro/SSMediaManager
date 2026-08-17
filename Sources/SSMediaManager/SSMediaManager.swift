@@ -10,7 +10,19 @@ import Foundation
 public class SSMediaManager{
     nonisolated(unsafe) public static let shared = SSMediaManager()
     
+    public var onNetworkStatusChange: ((Bool) -> Void)?
+    
     private init(){
+    }
+    
+    func networkStatusChanged(isConnected: Bool) {
+        DispatchQueue.main.async {
+            self.onNetworkStatusChange?(isConnected)
+        }
+    }
+    
+    public func cancelAllUploads() {
+        APIManager.shared.cancelAllRequests()
     }
     
     fileprivate func uploadFile(_ media: SSMedia, _ baseS3URL: String, _ indexPath: IndexPath, _ index: Int, _ completion: @escaping UploadCompletion) {
