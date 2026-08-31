@@ -71,15 +71,29 @@ public class EXIFMetadataHelper {
     
     /// Extract EXIF metadata from image file URL
     public static func extractEXIF(from fileURL: URL) -> [String: Any]? {
+        let ext = fileURL.pathExtension.lowercased()
+        if ext == "heic" || ext == "heif" {
+            // CGImageSourceCopyPropertiesAtIndex crashes on HEIC with malformed XMP
+            // (libexpat attempts a huge malloc inside the XML parser).
+            // CIImage.properties uses a different code path that is safe — verified
+            // on device with injected malformed XMP — and still returns EXIF data.
+            return CIImage(contentsOf: fileURL)?.properties
+        }
         guard let imageSource = CGImageSourceCreateWithURL(fileURL as CFURL, nil),
               let metadata = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any] else {
             return nil
         }
         return metadata
     }
-    
+
     /// Extract EXIF metadata from image data
     public static func extractEXIF(from imageData: Data) -> [String: Any]? {
+        if let imageSource = CGImageSourceCreateWithData(imageData as CFData, nil),
+           let uti = CGImageSourceGetType(imageSource) as String?,
+           uti.lowercased().contains("heic") || uti.lowercased().contains("heif") || uti.lowercased().contains("hevc") {
+            // Safe path for HEIC/HEIF — avoids the libexpat XMP crash
+            return CIImage(data: imageData)?.properties
+        }
         guard let imageSource = CGImageSourceCreateWithData(imageData as CFData, nil),
               let metadata = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [String: Any] else {
             return nil
