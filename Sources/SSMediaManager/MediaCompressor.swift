@@ -44,17 +44,24 @@ class MediaCompressor {
         }
     }
     
-    class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping () -> Void) {
+    // completion reports whether fileName is left on disk holding valid image data —
+    // false means the caller must not treat this file as upload-ready.
+    class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
+                guard let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                    // `return` only exits this autoreleasepool closure, not the outer async block.
+                    // completion() must be called here; there must be NO call after the pool closes.
+                    DispatchQueue.main.async { completion(false) }
+                    return
+                }
+
                 let modeValue = UserDefaults.standard.value(forKey: "CompressionModeFloat") as? CGFloat ?? 0.5
                 let compressionMode = CompressionMode(rawValue: modeValue) ?? .medium
 
-                guard compressionMode != .noCompression,
-                      let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
-                    // `return` only exits this autoreleasepool closure, not the outer async block.
-                    // completion() must be called here; there must be NO call after the pool closes.
-                    DispatchQueue.main.async { completion() }
+                guard compressionMode != .noCompression else {
+                    // Compression disabled — the file already on disk is untouched and still valid.
+                    DispatchQueue.main.async { completion(true) }
                     return
                 }
 
@@ -74,20 +81,30 @@ class MediaCompressor {
                 }
 
                 guard let imageToSave else {
-                    DispatchQueue.main.async { completion() }
+                    // Source file couldn't be loaded — whatever is at fileUrl is not usable.
+                    DispatchQueue.main.async { completion(false) }
                     return
                 }
 
+                var wroteSuccessfully = true
                 do {
                     try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
                 } catch {
                     // fixedOrientation() bakes the rotation into pixels before jpegData(), which strips EXIF metadata.
-                    imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0).flatMap { try? $0.write(to: fileUrl, options: .atomic) }
+                    if let fallbackData = imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0) {
+                        do {
+                            try fallbackData.write(to: fileUrl, options: .atomic)
+                        } catch {
+                            wroteSuccessfully = false
+                        }
+                    } else {
+                        wroteSuccessfully = false
+                    }
                 }
 
                 // Single terminal completion call — only reached via the happy path.
                 // All early-return paths above call completion() before their own `return`.
-                DispatchQueue.main.async { completion() }
+                DispatchQueue.main.async { completion(wroteSuccessfully) }
             }
             // Intentionally no completion() call here — `return` inside autoreleasepool only
             // exits that closure, so any call placed here would fire on every early-return path
