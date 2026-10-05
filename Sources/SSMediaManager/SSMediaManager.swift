@@ -111,7 +111,7 @@ public class SSMediaManager{
             }
 
             // Pass extracted EXIF so compressImage skips a redundant file open
-            MediaCompressor.compressImage(fileName: media.name, existingMetadata: mediaWithEXIF.exifMetadata) { success in
+            MediaCompressor.compressImage(fileName: media.name, filePath: media.filePath, existingMetadata: mediaWithEXIF.exifMetadata) { success in
                 guard success else {
                     // No valid file on disk to upload — fail loudly instead of PUTting an
                     // empty/missing file that S3 would otherwise accept silently.
@@ -174,7 +174,7 @@ public class SSMediaManager{
                     mediaWithEXIF.exifMetadata = EXIFMetadataHelper.extractEXIF(from: URL(fileURLWithPath: filePath))
                 }
                 // compressImage dispatches to its own background queue; completion fires on main.
-                MediaCompressor.compressImage(fileName: media.name, existingMetadata: mediaWithEXIF.exifMetadata) { success in
+                MediaCompressor.compressImage(fileName: media.name, filePath: media.filePath, existingMetadata: mediaWithEXIF.exifMetadata) { success in
                     completion(mediaWithEXIF, success)
                 }
             }

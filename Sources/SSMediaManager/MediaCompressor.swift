@@ -44,10 +44,14 @@ class MediaCompressor {
         }
     }
     
-    // Locates fileName on disk: Caches first, then Documents. Falls back to the Documents path
-    // when the file is in neither, so callers still get a URL to report a clean failure on.
-    private class func resolveImageFileURL(fileName: String) -> URL? {
+    // Locates the image on disk. The real path (media.filePath) wins when it exists; otherwise
+    // fileName is searched in Caches, then Documents. Falls back to the Documents path when the
+    // file is in none of them, so callers still get a URL to report a clean failure on.
+    private class func resolveImageFileURL(fileName: String, filePath: String?) -> URL? {
         let fm = FileManager.default
+        if let filePath, !filePath.isEmpty, fm.fileExists(atPath: filePath) {
+            return URL(fileURLWithPath: filePath)
+        }
         if let cachesUrl = fm.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent(fileName),
            fm.fileExists(atPath: cachesUrl.path) {
             return cachesUrl
@@ -57,10 +61,10 @@ class MediaCompressor {
 
     // completion reports whether fileName is left on disk holding valid image data —
     // false means the caller must not treat this file as upload-ready.
-    class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping (Bool) -> Void) {
+    class func compressImage(fileName: String, filePath: String? = nil, existingMetadata: [String: Any]? = nil, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
-                guard let fileUrl = resolveImageFileURL(fileName: fileName) else {
+                guard let fileUrl = resolveImageFileURL(fileName: fileName, filePath: filePath) else {
                     // `return` only exits this autoreleasepool closure, not the outer async block.
                     // completion() must be called here; there must be NO call after the pool closes.
                     DispatchQueue.main.async { completion(false) }
