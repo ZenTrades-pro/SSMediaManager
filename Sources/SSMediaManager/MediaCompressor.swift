@@ -44,12 +44,23 @@ class MediaCompressor {
         }
     }
     
+    // Locates fileName on disk: Caches first, then Documents. Falls back to the Documents path
+    // when the file is in neither, so callers still get a URL to report a clean failure on.
+    private class func resolveImageFileURL(fileName: String) -> URL? {
+        let fm = FileManager.default
+        if let cachesUrl = fm.urls(for: .cachesDirectory, in: .userDomainMask).first?.appendingPathComponent(fileName),
+           fm.fileExists(atPath: cachesUrl.path) {
+            return cachesUrl
+        }
+        return documentsUrl?.appendingPathComponent(fileName)
+    }
+
     // completion reports whether fileName is left on disk holding valid image data —
     // false means the caller must not treat this file as upload-ready.
     class func compressImage(fileName: String, existingMetadata: [String: Any]? = nil, completion: @escaping (Bool) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
-                guard let fileUrl = documentsUrl?.appendingPathComponent(fileName) else {
+                guard let fileUrl = resolveImageFileURL(fileName: fileName) else {
                     // `return` only exits this autoreleasepool closure, not the outer async block.
                     // completion() must be called here; there must be NO call after the pool closes.
                     DispatchQueue.main.async { completion(false) }
