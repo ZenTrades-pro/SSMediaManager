@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 import AVFoundation
 import ImageIO
 import UIKit
@@ -18,6 +19,25 @@ class MediaCompressor {
     private static var documentsUrl: URL? {
         return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
     }
+    static func stagingURL(for original: URL, extension fileExtension: String) -> URL {
+        original.deletingLastPathComponent()
+            .appendingPathComponent(UUID().uuidString)
+            .appendingPathExtension(fileExtension)
+    }
+
+    static func isUsableFile(at url: URL) -> Bool {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+              attributes[.type] as? FileAttributeType == .typeRegular,
+              let size = attributes[.size] as? NSNumber else { return false }
+        return size.int64Value > 0
+    }
+
+    static func replaceOriginal(at original: URL, with staged: URL) -> Bool {
+        guard isUsableFile(at: staged) else { return false }
+        // Both paths are in the same directory, so rename atomically replaces the original.
+        return Darwin.rename(staged.path, original.path) == 0
+    }
+
     class func compressVideo(inputURL: URL, outputURL: URL, completion: @escaping (URL?, Error?) -> Void) {
         let asset = AVURLAsset(url: inputURL)
         guard let exportSession = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetMediumQuality) else {
@@ -76,7 +96,7 @@ class MediaCompressor {
 
                 guard compressionMode != .noCompression else {
                     // Compression disabled — the file already on disk is untouched and still valid.
-                    DispatchQueue.main.async { completion(true) }
+                    DispatchQueue.main.async { completion(isUsableFile(at: fileUrl)) }
                     return
                 }
 
@@ -101,25 +121,28 @@ class MediaCompressor {
                     return
                 }
 
-                var wroteSuccessfully = true
+                let outputURL = stagingURL(for: fileUrl, extension: "jpg")
+                defer { try? FileManager.default.removeItem(at: outputURL) }
+
+                var encoded = false
                 do {
-                    try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: fileUrl, metadata: originalMetadata)
+                    try EXIFMetadataHelper.saveImageWithEXIF(image: imageToSave, to: outputURL, metadata: originalMetadata)
+                    encoded = true
                 } catch {
-                    // fixedOrientation() bakes the rotation into pixels before jpegData(), which strips EXIF metadata.
-                    if let fallbackData = imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0) {
+                    // Bake orientation into the pixels when JPEG encoding strips EXIF.
+                    if let data = imageToSave.fixedOrientation().jpegData(compressionQuality: 1.0) {
                         do {
-                            try fallbackData.write(to: fileUrl, options: .atomic)
+                            try data.write(to: outputURL, options: .atomic)
+                            encoded = true
                         } catch {
-                            wroteSuccessfully = false
+                            encoded = false
                         }
-                    } else {
-                        wroteSuccessfully = false
                     }
                 }
 
-                // Single terminal completion call — only reached via the happy path.
-                // All early-return paths above call completion() before their own `return`.
-                DispatchQueue.main.async { completion(wroteSuccessfully) }
+                let success = (encoded && replaceOriginal(at: fileUrl, with: outputURL)) ||
+                    isUsableFile(at: fileUrl)
+                DispatchQueue.main.async { completion(success) }
             }
             // Intentionally no completion() call here — `return` inside autoreleasepool only
             // exits that closure, so any call placed here would fire on every early-return path

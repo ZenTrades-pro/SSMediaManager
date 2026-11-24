@@ -25,28 +25,6 @@ public class SSMediaManager{
         APIManager.shared.cancelAllRequests()
     }
     
-    // Swaps a freshly-compressed video into the original file's path. Deliberately does NOT
-    // delete `inputUrl` until `outputUrl` is confirmed to exist, and verifies the final file
-    // is actually non-empty before reporting success — the previous `try?`-only version could
-    // delete the original and then silently fail to move the replacement in, leaving nothing
-    // on disk while still reporting success.
-    private func replaceFile(at inputUrl: URL, withCompressedFileAt outputUrl: URL) -> Bool {
-        let fm = FileManager.default
-        guard fm.fileExists(atPath: outputUrl.path) else { return false }
-        do {
-            if fm.fileExists(atPath: inputUrl.path) {
-                try fm.removeItem(at: inputUrl)
-            }
-            try fm.moveItem(at: outputUrl, to: inputUrl)
-        } catch {
-            return false
-        }
-        guard let size = try? fm.attributesOfItem(atPath: inputUrl.path)[.size] as? UInt64, size > 0 else {
-            return false
-        }
-        return true
-    }
-
     fileprivate func uploadFile(_ media: SSMedia, _ baseS3URL: String, _ indexPath: IndexPath, _ index: Int, _ completion: @escaping UploadCompletion) {
         APIManager.shared.getUploadUrl(media: media, baseS3URL: baseS3URL, indexPath: indexPath, index: index) { json, data, response, error, indexPath, index in
             var mediaWithS3 = media
@@ -67,39 +45,15 @@ public class SSMediaManager{
         let safeIndex = index ?? 0
 
         if (media.mimeType ?? "").contains("video") {
-            let inputUrl = URL(fileURLWithPath: media.filePath ?? "")
-
-            // Extract video metadata before compression
-            var mediaWithMetadata = media
-            if let filePath = media.filePath {
-                let fileUrl = URL(fileURLWithPath: filePath)
-                mediaWithMetadata.exifMetadata = EXIFMetadataHelper.extractVideoMetadata(from: fileUrl)
-            }
-
-            let fileNameWithoutExtension = self.removeExtension(fileName: media.name)
-            let fileManager = FileManager.default
-            let documentsUrl = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-            let compressedName = "compressed_\(fileNameWithoutExtension).mp4"
-            let outputUrl = documentsUrl.appendingPathComponent(compressedName)
-            MediaCompressor.compressVideo(inputURL: inputUrl, outputURL: outputUrl) { url, error in
-                guard error == nil, url != nil else {
-                    debugPrint("Error in compression>>\(String(describing: error))")
-                    self.uploadFile(mediaWithMetadata, baseS3URL, safeIndexPath, safeIndex, completion)
-                    return
-                }
-                guard self.replaceFile(at: inputUrl, withCompressedFileAt: outputUrl) else {
-                    // Compression succeeded but swapping it into place failed — the original
-                    // may already be gone. Nothing safe left to upload; fail loudly.
+            compressMediaFile(media: media) { preparedMedia, success in
+                guard success else {
                     completion(nil, nil, nil, NSError(
                         domain: "SSMediaManager", code: -3,
-                        userInfo: [NSLocalizedDescriptionKey: "Upload failed: compressed video could not replace the original file on disk"]
+                        userInfo: [NSLocalizedDescriptionKey: "Upload failed: no usable local video file"]
                     ), safeIndexPath, safeIndex)
                     return
                 }
-                var tempMedia = mediaWithMetadata
-                tempMedia.filePath = inputUrl.path
-                tempMedia.mimeType = "video/mp4"
-                self.uploadFile(tempMedia, baseS3URL, safeIndexPath, safeIndex, completion)
+                self.uploadFile(preparedMedia, baseS3URL, safeIndexPath, safeIndex, completion)
             }
 
         } else if (media.mimeType ?? "").hasPrefix("image") {
@@ -139,25 +93,26 @@ public class SSMediaManager{
     public func compressMediaFile(media: SSMedia, completion: @escaping (SSMedia, Bool) -> Void) {
         if (media.mimeType ?? "").contains("video") {
             DispatchQueue.global(qos: .userInitiated).async {
-                var mediaWithMetadata = media
-                if let filePath = media.filePath {
-                    mediaWithMetadata.exifMetadata = EXIFMetadataHelper.extractVideoMetadata(from: URL(fileURLWithPath: filePath))
+                guard let filePath = media.filePath, !filePath.isEmpty else {
+                    DispatchQueue.main.async { completion(media, false) }
+                    return
                 }
-                let inputUrl = URL(fileURLWithPath: media.filePath ?? "")
-                let documentsUrl = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                let outputUrl = documentsUrl.appendingPathComponent("compressed_\(self.removeExtension(fileName: media.name)).mp4")
+                let inputUrl = URL(fileURLWithPath: filePath)
+                guard MediaCompressor.isUsableFile(at: inputUrl) else {
+                    DispatchQueue.main.async { completion(media, false) }
+                    return
+                }
+                var mediaWithMetadata = media
+                mediaWithMetadata.exifMetadata = EXIFMetadataHelper.extractVideoMetadata(from: inputUrl)
+                let outputUrl = MediaCompressor.stagingURL(for: inputUrl, extension: "mp4")
                 MediaCompressor.compressVideo(inputURL: inputUrl, outputURL: outputUrl) { url, error in
+                    defer { try? FileManager.default.removeItem(at: outputUrl) }
+                    let replaced = error == nil && url != nil &&
+                        MediaCompressor.replaceOriginal(at: inputUrl, with: outputUrl)
+                    let originalIsUsable = MediaCompressor.isUsableFile(at: inputUrl)
                     DispatchQueue.main.async {
-                        guard error == nil, url != nil else {
-                            // Compression failed, but the original file at mediaWithMetadata.filePath
-                            // was never touched — still valid to upload as-is.
-                            completion(mediaWithMetadata, true)
-                            return
-                        }
-                        guard self.replaceFile(at: inputUrl, withCompressedFileAt: outputUrl) else {
-                            // Compression succeeded but swapping it into place failed — the
-                            // original may already be gone. Nothing safe left to upload.
-                            completion(mediaWithMetadata, false)
+                        guard replaced else {
+                            completion(mediaWithMetadata, originalIsUsable)
                             return
                         }
                         var tempMedia = mediaWithMetadata
