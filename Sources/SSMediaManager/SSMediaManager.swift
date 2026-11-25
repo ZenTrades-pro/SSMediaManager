@@ -57,25 +57,15 @@ public class SSMediaManager{
             }
 
         } else if (media.mimeType ?? "").hasPrefix("image") {
-            // Extract EXIF metadata before compression
-            var mediaWithEXIF = media
-            if let filePath = media.filePath {
-                let fileUrl = URL(fileURLWithPath: filePath)
-                mediaWithEXIF.exifMetadata = EXIFMetadataHelper.extractEXIF(from: fileUrl)
-            }
-
-            // Pass extracted EXIF so compressImage skips a redundant file open
-            MediaCompressor.compressImage(fileName: media.name, filePath: media.filePath, existingMetadata: mediaWithEXIF.exifMetadata) { success in
+            compressMediaFile(media: media) { preparedMedia, success in
                 guard success else {
-                    // No valid file on disk to upload — fail loudly instead of PUTting an
-                    // empty/missing file that S3 would otherwise accept silently.
                     completion(nil, nil, nil, NSError(
                         domain: "SSMediaManager", code: -2,
                         userInfo: [NSLocalizedDescriptionKey: "Upload failed: compression left no valid file on disk"]
                     ), safeIndexPath, safeIndex)
                     return
                 }
-                self.uploadFile(mediaWithEXIF, baseS3URL, safeIndexPath, safeIndex, completion)
+                self.uploadFile(preparedMedia, baseS3URL, safeIndexPath, safeIndex, completion)
             }
 
         } else {
@@ -109,12 +99,19 @@ public class SSMediaManager{
                     defer { try? FileManager.default.removeItem(at: outputUrl) }
                     let replaced = error == nil && url != nil &&
                         MediaCompressor.replaceOriginal(at: inputUrl, with: outputUrl)
-                    let originalIsUsable = MediaCompressor.isUsableFile(at: inputUrl)
-                    DispatchQueue.main.async {
-                        guard replaced else {
-                            completion(mediaWithMetadata, originalIsUsable)
-                            return
+                    guard replaced else {
+                        Task {
+                            let originalIsPlayable = await MediaCompressor.isPlayableVideo(at: inputUrl)
+                            var fallbackMedia = mediaWithMetadata
+                            if originalIsPlayable, let actualMIME = MediaCompressor.videoMIMEType(at: inputUrl) {
+                                fallbackMedia.mimeType = actualMIME
+                            }
+                            let preparedMedia = fallbackMedia
+                            await MainActor.run { completion(preparedMedia, originalIsPlayable) }
                         }
+                        return
+                    }
+                    DispatchQueue.main.async {
                         var tempMedia = mediaWithMetadata
                         tempMedia.filePath = inputUrl.path
                         tempMedia.mimeType = "video/mp4"
@@ -129,8 +126,19 @@ public class SSMediaManager{
                     mediaWithEXIF.exifMetadata = EXIFMetadataHelper.extractEXIF(from: URL(fileURLWithPath: filePath))
                 }
                 // compressImage dispatches to its own background queue; completion fires on main.
-                MediaCompressor.compressImage(fileName: media.name, filePath: media.filePath, existingMetadata: mediaWithEXIF.exifMetadata) { success in
-                    completion(mediaWithEXIF, success)
+                MediaCompressor.compressImage(fileName: media.name, filePath: media.filePath, existingMetadata: mediaWithEXIF.exifMetadata) { result in
+                    guard let result else {
+                        completion(mediaWithEXIF, false)
+                        return
+                    }
+                    var preparedMedia = mediaWithEXIF
+                    preparedMedia.filePath = result.fileURL.path
+                    if result.wroteJPEG {
+                        preparedMedia.mimeType = "image/jpeg"
+                    } else if let actualMIME = MediaCompressor.imageMIMEType(at: result.fileURL) {
+                        preparedMedia.mimeType = actualMIME
+                    }
+                    completion(preparedMedia, true)
                 }
             }
         } else {

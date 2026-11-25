@@ -9,6 +9,7 @@ import Foundation
 import Darwin
 import AVFoundation
 import ImageIO
+import UniformTypeIdentifiers
 import UIKit
 
 var documentsUrl: URL? {
@@ -32,10 +33,47 @@ class MediaCompressor {
         return size.int64Value > 0
     }
 
+    static func imageMIMEType(at url: URL) -> String? {
+        let options = [kCGImageSourceShouldCache: false] as CFDictionary
+        guard let image = CGImageSourceCreateWithURL(url as CFURL, options),
+              let identifier = CGImageSourceGetType(image) else { return nil }
+        return UTType(identifier as String)?.preferredMIMEType
+    }
+
+    static func videoMIMEType(at url: URL) -> String? {
+        guard let file = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? file.close() }
+        guard let header = try? file.read(upToCount: 12), header.count == 12,
+              header[4..<8].elementsEqual("ftyp".utf8),
+              let brand = String(bytes: header[8..<12], encoding: .ascii) else { return nil }
+
+        switch brand {
+        case "qt  ": return "video/quicktime"
+        case "isom", "iso2", "iso3", "iso4", "iso5", "iso6", "mp41", "mp42", "avc1", "M4V ":
+            return "video/mp4"
+        default: return nil
+        }
+    }
+
     static func replaceOriginal(at original: URL, with staged: URL) -> Bool {
         guard isUsableFile(at: staged) else { return false }
         // Both paths are in the same directory, so rename atomically replaces the original.
         return Darwin.rename(staged.path, original.path) == 0
+    }
+
+    static func isPlayableVideo(at url: URL) async -> Bool {
+        guard isUsableFile(at: url) else { return false }
+        let asset = AVURLAsset(url: url)
+        do {
+            guard try await asset.load(.isPlayable) else { return false }
+            let generator = AVAssetImageGenerator(asset: asset)
+            generator.maximumSize = CGSize(width: 32, height: 32)
+            // A nonempty, playable container can still contain undecodable video samples.
+            _ = try await generator.image(at: .zero)
+            return true
+        } catch {
+            return false
+        }
     }
 
     class func compressVideo(inputURL: URL, outputURL: URL, completion: @escaping (URL?, Error?) -> Void) {
@@ -79,15 +117,14 @@ class MediaCompressor {
         return documentsUrl?.appendingPathComponent(fileName)
     }
 
-    // completion reports whether fileName is left on disk holding valid image data —
-    // false means the caller must not treat this file as upload-ready.
-    class func compressImage(fileName: String, filePath: String? = nil, existingMetadata: [String: Any]? = nil, completion: @escaping (Bool) -> Void) {
+    // Returns the usable file and whether JPEG output replaced its original contents.
+    class func compressImage(fileName: String, filePath: String? = nil, existingMetadata: [String: Any]? = nil, completion: @escaping ((fileURL: URL, wroteJPEG: Bool)?) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             autoreleasepool {
                 guard let fileUrl = resolveImageFileURL(fileName: fileName, filePath: filePath) else {
                     // `return` only exits this autoreleasepool closure, not the outer async block.
                     // completion() must be called here; there must be NO call after the pool closes.
-                    DispatchQueue.main.async { completion(false) }
+                    DispatchQueue.main.async { completion(nil) }
                     return
                 }
 
@@ -96,7 +133,7 @@ class MediaCompressor {
 
                 guard compressionMode != .noCompression else {
                     // Compression disabled — the file already on disk is untouched and still valid.
-                    DispatchQueue.main.async { completion(isUsableFile(at: fileUrl)) }
+                    DispatchQueue.main.async { completion(isUsableFile(at: fileUrl) ? (fileUrl, false) : nil) }
                     return
                 }
 
@@ -117,7 +154,7 @@ class MediaCompressor {
 
                 guard let imageToSave else {
                     // Source file couldn't be loaded — whatever is at fileUrl is not usable.
-                    DispatchQueue.main.async { completion(false) }
+                    DispatchQueue.main.async { completion(nil) }
                     return
                 }
 
@@ -140,9 +177,9 @@ class MediaCompressor {
                     }
                 }
 
-                let success = (encoded && replaceOriginal(at: fileUrl, with: outputURL)) ||
-                    isUsableFile(at: fileUrl)
-                DispatchQueue.main.async { completion(success) }
+                let wroteJPEG = encoded && replaceOriginal(at: fileUrl, with: outputURL)
+                let result: (URL, Bool)? = wroteJPEG || isUsableFile(at: fileUrl) ? (fileUrl, wroteJPEG) : nil
+                DispatchQueue.main.async { completion(result) }
             }
             // Intentionally no completion() call here — `return` inside autoreleasepool only
             // exits that closure, so any call placed here would fire on every early-return path
